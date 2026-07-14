@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, List, Literal
 
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
@@ -23,6 +24,7 @@ from uk_address_matcher.analysis.table_stage_diagnostics import (
     build_stage_diagnostics_table,
 )
 from uk_address_matcher.post_linkage.analyse_results import _calculate_match_metrics
+from uk_address_matcher.post_linkage.labelling import create_labelling_tool
 from uk_address_matcher.post_linkage.match_result.debug_tools import (
     _MatchResultDebugTools,
 )
@@ -107,6 +109,39 @@ class MatchResult:
         """Match-reason breakdown with counts and percentages"""
 
         return _calculate_match_metrics(self._relation, order=order)
+
+    def create_labelling_tool(
+        self,
+        output_path: str | Path,
+        *,
+        max_candidates: int = 5,
+        messy_ids: list[str | int] | None = None,
+        overwrite: bool = False,
+    ) -> Path:
+        """Create a self-contained browser tool for clerical review.
+
+        The tool contains records that reached the configured ``SplinkStage``
+        and their retained ranked candidates. It works offline and can export
+        exact record-level JSON labels, a spreadsheet-safe record-level CSV,
+        and an optional candidate-pair compatibility CSV.
+
+        Args:
+            output_path: Destination for the generated HTML file.
+            max_candidates: Maximum candidates displayed per source record.
+            messy_ids: Optional source ``unique_id`` values to include. Omit to
+                include every record retained by the Splink stage.
+            overwrite: Replace an existing destination when true.
+
+        Returns:
+            The generated HTML path.
+        """
+        return create_labelling_tool(
+            self,
+            output_path,
+            max_candidates=max_candidates,
+            messy_ids=messy_ids,
+            overwrite=overwrite,
+        )
 
     def _has_splink(self) -> bool:
         """True when a Splink stage was configured in the pipeline."""
