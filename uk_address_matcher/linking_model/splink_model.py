@@ -3,7 +3,7 @@ import json
 import logging
 from contextlib import contextmanager
 
-from duckdb import DuckDBPyConnection, DuckDBPyRelation
+from duckdb import DuckDBPyConnection, DuckDBPyRelation, InvalidInputException
 from splink import DuckDBAPI, Linker, SettingsCreator
 
 from uk_address_matcher.sql_pipeline.helpers import package_resource_read_sql
@@ -234,19 +234,20 @@ def _get_linker(
     # df_addresses_to_search_within_fix = con.table("df_addresses_to_search_within_fix")
     df_addresses_to_search_within_fix = df_addresses_to_search_within
 
-    # Drop stale Splink views/tables from any prior linker on this connection.
-    messy_name, canonical_name = (
-        "m_",
-        "c_",
-    )
-
-    for tbl in (messy_name, canonical_name):
-        con.execute(f"DROP VIEW IF EXISTS {tbl}")
-        con.execute(f"DROP TABLE IF EXISTS {tbl}")
+    messy_name, canonical_name = "m_", "c_"
+    for table_name, relation in (
+        (messy_name, df_addresses_to_match_fix),
+        (canonical_name, df_addresses_to_search_within_fix),
+    ):
+        try:
+            con.unregister(table_name)
+        except InvalidInputException:
+            pass
+        con.register(table_name, relation)
 
     with _suppress_known_splink_warnings():
         linker = Linker(
-            [df_addresses_to_match_fix, df_addresses_to_search_within_fix],
+            [messy_name, canonical_name],
             settings=settings,
             db_api=db_api,
             input_table_aliases=[messy_name, canonical_name],

@@ -183,16 +183,11 @@ def _drop_table_and_registered_aliases(
     con: duckdb.DuckDBPyConnection,
     table_name: str,
 ) -> None:
-    object_row = con.execute(
-        "SELECT table_type FROM information_schema.tables WHERE table_name = ?",
+    view_exists = con.execute(
+        "SELECT 1 FROM duckdb_views() WHERE view_name = ?",
         [table_name],
     ).fetchone()
-
-    if object_row is None:
-        return
-
-    object_type = object_row[0]
-    if object_type == "VIEW":
+    if view_exists is not None:
         con.execute(f"DROP VIEW IF EXISTS {_quote_identifier(table_name)}")
         return
 

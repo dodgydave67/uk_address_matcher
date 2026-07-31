@@ -93,6 +93,7 @@ class SplinkStage(MatchingStage):
     predictions_table: str | None = field(default=None, init=False, repr=False)
     improved_predictions_table: str | None = field(default=None, init=False, repr=False)
     best_matches_table: str | None = field(default=None, init=False, repr=False)
+    _owned_table_names: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def find_matches(
         self,
@@ -143,6 +144,12 @@ class SplinkStage(MatchingStage):
         df_predict = linker.inference.predict(
             threshold_match_weight=self.predict_threshold_match_weight
         )
+        linker_uid = linker._cache_uid
+        self._owned_table_names = (
+            df_predict.physical_name,
+            f"__splink__df_concat_with_tf_{linker_uid}",
+            *(f"__splink__df_tf_numeric_token_{i}_{linker_uid}" for i in range(1, 4)),
+        )
         df_predict_ddb = df_predict.as_duckdbpyrelation()
 
         table_name = f"__ukam__splink__predictions__{_uid()}"
@@ -182,6 +189,8 @@ class SplinkStage(MatchingStage):
         df_best_name = f"__ukam__splink__best_matches__{_uid()}"
         df_best.create(df_best_name)
         self.best_matches_table = df_best_name
+        con.unregister("m_")
+        con.unregister("c_")
 
         # Step 5: Apply thresholds and project to standard columns
         splink_label = MatchReason.SPLINK.value

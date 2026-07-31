@@ -412,14 +412,41 @@ def test_sequential_matchers_allow_new_canonical_and_splink_stage(
         stages=[SplinkStage(final_match_weight_threshold=-20.0)],
     ).match()
 
+    first_tables = set(first_result._owned_table_names)
+    second_tables = set(second_result._owned_table_names)
+    assert first_tables
+    assert second_tables
+    assert first_tables.isdisjoint(second_tables)
     assert first_result.matches().count("*").fetchone()[0] == 2
     assert second_result.matches().count("*").fetchone()[0] == 2
+
+    first_result.close()
+    remaining_tables = {name for (name,) in con.execute("SHOW TABLES").fetchall()}
+    assert first_tables.isdisjoint(remaining_tables)
+    assert second_tables <= remaining_tables
+    assert second_result.matches().count("*").fetchone()[0] == 2
+
+    second_result.close()
+    remaining_tables = {name for (name,) in con.execute("SHOW TABLES").fetchall()}
+    assert second_tables.isdisjoint(remaining_tables)
+    run_scoped_prefixes = (
+        "__splink__",
+        "__ukam__processed_",
+        "__ukam__splink__",
+        "__ukam__inverted_index_",
+        "__ukam_derived_inverted_index_",
+        "__ukam_final_matches_",
+    )
+    assert not any(name.startswith(run_scoped_prefixes) for name in remaining_tables)
+    second_result.close()
 
 
 def test_splink_matching_preserves_user_tables_with_legacy_internal_names(
     con, canonical_data, messy_data
 ):
     user_table_names = (
+        "m_",
+        "c_",
         "good_matches",
         "top_n_matches",
         "token_addresses",

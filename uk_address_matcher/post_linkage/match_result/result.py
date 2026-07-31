@@ -27,6 +27,7 @@ from uk_address_matcher.post_linkage.match_result.debug_tools import (
     _MatchResultDebugTools,
 )
 from uk_address_matcher.post_linkage.match_result.splink_inspector import _SplinkInspector
+from uk_address_matcher.sql_pipeline.helpers import _drop_table_and_registered_aliases
 
 if TYPE_CHECKING:
     from uk_address_matcher.linking_model.matching.stages.splink import SplinkStage
@@ -46,6 +47,7 @@ class MatchResult:
     Key methods:
         match_metrics      - match-reason breakdown with counts and percentages.
         match_reasons      - distinct match-reason values.
+        close              - release tables retained for result inspection.
         _splink_predictions - raw Splink predictions table (requires `SplinkStage`).
     """
 
@@ -55,6 +57,7 @@ class MatchResult:
     _canonical_relation: DuckDBPyRelation | None = None
     _messy_relation: DuckDBPyRelation | None = None
     _stage_diagnostics: StageDiagnostics | None = None
+    _owned_table_names: tuple[str, ...] = ()
 
     def __repr__(self) -> str:
         class_name = self.__class__.__name__
@@ -98,6 +101,12 @@ class MatchResult:
             FROM ({base_relation_sql}) AS match_result
             """
         )
+
+    def close(self) -> None:
+        """Release tables retained for this result's inspection methods."""
+        for table_name in self._owned_table_names:
+            _drop_table_and_registered_aliases(self.con, table_name)
+        self._owned_table_names = ()
 
     def match_metrics(
         self,
