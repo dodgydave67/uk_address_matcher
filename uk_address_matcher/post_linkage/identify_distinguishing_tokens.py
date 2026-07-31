@@ -2,9 +2,30 @@ from __future__ import annotations
 
 from duckdb import DuckDBPyConnection, DuckDBPyRelation
 
-from uk_address_matcher.sql_pipeline.helpers import _uid
+from uk_address_matcher.sql_pipeline.helpers import (
+    _drop_table_and_registered_aliases,
+    _quote_identifier,
+    _uid,
+)
 
 _POSITIONAL_TOKENS_SQL = "('LEFT', 'RIGHT', 'CENTRE', 'FRONT')"
+
+
+def _materialise_temp_table(
+    *,
+    con: DuckDBPyConnection,
+    table_name: str,
+    query: str,
+    cleanup_tables: tuple[str, ...],
+) -> None:
+    try:
+        con.execute(
+            f"CREATE TEMP TABLE {_quote_identifier(table_name)} AS {query}"
+        )
+    except BaseException:
+        for cleanup_table in cleanup_tables:
+            _drop_table_and_registered_aliases(con, cleanup_table)
+        raise
 
 
 def improve_predictions_using_distinguishing_tokens(
@@ -29,6 +50,13 @@ def improve_predictions_using_distinguishing_tokens(
     top_n_matches_table = f"__ukam__tmp_top_n_matches_{table_suffix}"
     token_addresses_table = f"__ukam__tmp_token_addresses_{table_suffix}"
     block_statistics_table = f"__ukam__tmp_block_statistics_{table_suffix}"
+    intermediate_tables = (
+        good_matches_table,
+        top_n_matches_table,
+        token_addresses_table,
+        block_statistics_table,
+    )
+    all_tables = (matches_table, *intermediate_tables)
 
     retained_columns = ""
     if additional_columns_to_retain:
@@ -66,26 +94,40 @@ def improve_predictions_using_distinguishing_tokens(
         ).flatten() AS bigrams_in_block_l,
         """
 
-    con.sql(f"""
+    _materialise_temp_table(
+        con=con,
+        table_name=good_matches_table,
+        cleanup_tables=all_tables,
+        query=f"""
         SELECT *
-        FROM df_predict
+        FROM ({df_predict.sql_query()}) AS df_predict
         WHERE match_weight > {match_weight_threshold}
         QUALIFY ROW_NUMBER() OVER (
             PARTITION BY unique_id_r, unique_id_l
             ORDER BY match_weight DESC, ukam_address_id_r DESC, ukam_address_id_l DESC
         ) = 1
-    """).create(good_matches_table)
+        """,
+    )
 
-    con.sql(f"""
+    _materialise_temp_table(
+        con=con,
+        table_name=top_n_matches_table,
+        cleanup_tables=all_tables,
+        query=f"""
         SELECT *
         FROM {good_matches_table}
         QUALIFY ROW_NUMBER() OVER (
             PARTITION BY unique_id_r
             ORDER BY match_weight DESC, unique_id_l DESC
         ) <= {top_n_matches}
-    """).create(top_n_matches_table)
+        """,
+    )
 
-    con.sql(f"""
+    _materialise_temp_table(
+        con=con,
+        table_name=token_addresses_table,
+        cleanup_tables=all_tables,
+        query=f"""
         WITH intermediate AS (
             SELECT *, map_keys(common_end_tokens_hist_r) AS common_end_tokens_r
             FROM {top_n_matches_table}
@@ -136,9 +178,14 @@ def improve_predictions_using_distinguishing_tokens(
                 .list_reverse()
                 .array_to_string(' ') AS __token_address_r
         FROM enriched
-    """).create(token_addresses_table)
+        """,
+    )
 
-    con.sql(f"""
+    _materialise_temp_table(
+        con=con,
+        table_name=block_statistics_table,
+        cleanup_tables=all_tables,
+        query=f"""
         WITH source_tokens AS (
             SELECT DISTINCT
                 ukam_address_id_r,
@@ -190,9 +237,14 @@ def improve_predictions_using_distinguishing_tokens(
                 pair -> ARRAY[pair[1], pair[2]]
             ) AS bigrams_r
         FROM block_histograms
-    """).create(block_statistics_table)
+        """,
+    )
 
-    con.sql(f"""
+    _materialise_temp_table(
+        con=con,
+        table_name=matches_table,
+        cleanup_tables=all_tables,
+        query=f"""
         WITH intermediate AS (
             SELECT
                 candidate.match_weight,
@@ -420,6 +472,10 @@ def improve_predictions_using_distinguishing_tokens(
             postcode_r,
             {retained_columns}
         FROM scored_candidates
-    """).create(matches_table)
+        """,
+    )
+
+    for intermediate_table in intermediate_tables:
+        _drop_table_and_registered_aliases(con, intermediate_table)
 
     return con.table(matches_table)

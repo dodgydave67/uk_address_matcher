@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Union
+from weakref import WeakKeyDictionary
 
 from uk_address_matcher.cleaning.chunking_strategies import (
     derive_inverted_index,
@@ -16,16 +18,23 @@ from uk_address_matcher.cleaning.steps.inverted_index import (
 from uk_address_matcher.helpers.canonical_inputs import (
     normalise_and_validate_raw_canonical,
 )
-from uk_address_matcher.helpers.path_parsing import is_remote_folder_reference
+from uk_address_matcher.helpers.path_parsing import (
+    is_remote_folder_reference,
+    join_remote_path,
+)
 from uk_address_matcher.linking_model.address_record import AddressRecord
 from uk_address_matcher.linking_model.matching.runner import _run_matching
 from uk_address_matcher.linking_model.matching.stages.base_stage import MatchingStage
 from uk_address_matcher.linking_model.matching.stages.splink import SplinkStage
 from uk_address_matcher.logging.progress import ShowProgress, resolve_progress_mode
 from uk_address_matcher.post_linkage.match_result import MatchResult
-from uk_address_matcher.prepare_canonical import load_prepared_canonical_data
+from uk_address_matcher.prepare_canonical import (
+    MANIFEST_FILENAME,
+    load_prepared_canonical_data,
+)
 from uk_address_matcher.sql_pipeline.helpers import (
     _drop_table_and_registered_aliases,
+    _quote_identifier,
     _register_input_relation_once,
     _uid,
 )
@@ -37,13 +46,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("uk_address_matcher")
 
-_PREPARED_CANONICAL_CACHE: dict[
-    int, dict[tuple[str, str | None], "_PreparedCanonicalCacheEntry"]
-] = {}
+_PREPARED_CANONICAL_CACHE: WeakKeyDictionary = WeakKeyDictionary()
 
 
 @dataclass(frozen=True)
 class _PreparedCanonicalCacheEntry:
+    source_signature: str | None
     addresses_table_name: str
     term_frequencies_table_name: str
     inverted_index_table_name: str
@@ -277,11 +285,20 @@ class AddressMatcher:
 
     def _get_or_load_prepared_canonical(self) -> _PreparedCanonicalCacheEntry:
         cache_key = self._prepared_canonical_cache_key()
-        cache = _PREPARED_CANONICAL_CACHE.setdefault(id(self.con), {})
+        cache = _PREPARED_CANONICAL_CACHE.setdefault(self.con, {})
+        source_signature = self._prepared_canonical_source_signature()
         cached = cache.get(cache_key)
-        if cached is not None and self._prepared_canonical_tables_exist(cached):
+        if (
+            cached is not None
+            and cached.source_signature == source_signature
+            and self._prepared_canonical_tables_exist(cached)
+        ):
             logger.debug("Reusing prepared canonical data from '%s'", self._raw_canonical)
             return cached
+
+        if cached is not None:
+            self._drop_prepared_canonical_cache_entry(cached)
+            cache.pop(cache_key, None)
 
         logger.debug("Loading prepared canonical data from '%s'", self._raw_canonical)
         prepared = load_prepared_canonical_data(
@@ -289,16 +306,30 @@ class AddressMatcher:
             self.con,
             canonical_address_filter=self.canonical_address_filter,
         )
-        cached = _PreparedCanonicalCacheEntry(
-            addresses_table_name=self._materialise_prepared_relation(
+        materialised_tables = []
+        try:
+            addresses_table_name = self._materialise_prepared_relation(
                 prepared.addresses, "canonical_addresses"
-            ),
-            term_frequencies_table_name=self._materialise_prepared_relation(
+            )
+            materialised_tables.append(addresses_table_name)
+            term_frequencies_table_name = self._materialise_prepared_relation(
                 prepared.term_frequencies, "term_frequencies"
-            ),
-            inverted_index_table_name=self._materialise_prepared_relation(
+            )
+            materialised_tables.append(term_frequencies_table_name)
+            inverted_index_table_name = self._materialise_prepared_relation(
                 prepared.inverted_index, "inverted_index"
-            ),
+            )
+            materialised_tables.append(inverted_index_table_name)
+        except BaseException:
+            for table_name in materialised_tables:
+                _drop_table_and_registered_aliases(self.con, table_name)
+            raise
+
+        cached = _PreparedCanonicalCacheEntry(
+            source_signature=source_signature,
+            addresses_table_name=addresses_table_name,
+            term_frequencies_table_name=term_frequencies_table_name,
+            inverted_index_table_name=inverted_index_table_name,
         )
         cache[cache_key] = cached
         return cached
@@ -308,6 +339,47 @@ class AddressMatcher:
         if not is_remote_folder_reference(folder):
             folder = str(Path(folder).expanduser().resolve())
         return folder, self.canonical_address_filter
+
+    def _prepared_canonical_source_signature(self) -> str | None:
+        if is_remote_folder_reference(self._raw_canonical):
+            manifest_uri = join_remote_path(
+                str(self._raw_canonical), MANIFEST_FILENAME
+            )
+            try:
+                manifest = self.con.read_json(manifest_uri)
+                payload = (tuple(manifest.columns), manifest.fetchone())
+            except Exception:
+                return None
+            return sha256(repr(payload).encode()).hexdigest()
+
+        folder = Path(self._raw_canonical).expanduser().resolve()
+        manifest = folder / MANIFEST_FILENAME
+        if manifest.is_file():
+            return sha256(manifest.read_bytes()).hexdigest()
+
+        artefact_stats = []
+        for path in sorted(folder.rglob("*.parquet")):
+            stat = path.stat()
+            artefact_stats.append(
+                (
+                    str(path.relative_to(folder)),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
+        return sha256(repr(artefact_stats).encode()).hexdigest()
+
+    def _drop_prepared_canonical_cache_entry(
+        self,
+        cached: _PreparedCanonicalCacheEntry,
+    ) -> None:
+        for table_name in (
+            cached.addresses_table_name,
+            cached.term_frequencies_table_name,
+            cached.inverted_index_table_name,
+        ):
+            _drop_table_and_registered_aliases(self.con, table_name)
 
     def _prepared_canonical_tables_exist(
         self, cached: _PreparedCanonicalCacheEntry
@@ -332,7 +404,11 @@ class AddressMatcher:
         artefact_name: str,
     ) -> str:
         table_name = f"__ukam__prepared_{artefact_name}_{_uid()}"
-        relation.create(table_name)
+        object_type = "TABLE" if artefact_name == "canonical_addresses" else "VIEW"
+        self.con.execute(
+            f"CREATE TEMP {object_type} {_quote_identifier(table_name)} AS "
+            + relation.sql_query()
+        )
         return table_name
 
     def _resolve_messy_data(self) -> None:

@@ -609,3 +609,13 @@ def test_sub_premise_location_discrimination_in_reranker():
         "Expected the positional conflict to demote the LEFT sibling by ~one penalty; "
         f"got gap={mw_missing - mw_left:.3f}."
     )
+
+    internal_intermediates = con.execute(
+        """
+        SELECT table_name
+        FROM duckdb_tables()
+        WHERE table_name SIMILAR TO
+            '__ukam__tmp_(good_matches|top_n_matches|token_addresses|block_statistics)_%'
+        """
+    ).fetchall()
+    assert internal_intermediates == []

@@ -1,7 +1,9 @@
+import gc
 import logging
 import re
 import tempfile
 from pathlib import Path
+from weakref import ref
 
 import duckdb
 import pyarrow
@@ -371,6 +373,72 @@ def test_sequential_matchers_share_connection_with_splink(
     assert first_result.matches().count("*").fetchone()[0] == 2
     assert second_result.matches().count("*").fetchone()[0] == 1
     assert first_cache_uid != second_cache_uid
+    internal_post_linkage_tables = con.execute(
+        """
+        SELECT table_name
+        FROM duckdb_tables()
+        WHERE table_name SIMILAR TO
+            '__ukam__tmp_(good_matches|top_n_matches|token_addresses|block_statistics)_%'
+        """
+    ).fetchall()
+    assert internal_post_linkage_tables == []
+
+
+def test_sequential_matchers_allow_new_canonical_and_splink_stage(
+    con, canonical_data, messy_data
+):
+    first_result = AddressMatcher(
+        canonical_addresses=canonical_data,
+        addresses_to_match=messy_data,
+        con=con,
+        stages=[SplinkStage(final_match_weight_threshold=-20.0)],
+    ).match()
+
+    second_canonical_data = _make_addresses(
+        con,
+        [
+            {
+                "unique_id": "C4",
+                "address_concat": "4 new street leeds",
+                "postcode": "LS1 1AA",
+            },
+            *CANONICAL_RECORDS,
+        ],
+    )
+    second_result = AddressMatcher(
+        canonical_addresses=second_canonical_data,
+        addresses_to_match=messy_data,
+        con=con,
+        stages=[SplinkStage(final_match_weight_threshold=-20.0)],
+    ).match()
+
+    assert first_result.matches().count("*").fetchone()[0] == 2
+    assert second_result.matches().count("*").fetchone()[0] == 2
+
+
+def test_splink_matching_preserves_user_tables_with_legacy_internal_names(
+    con, canonical_data, messy_data
+):
+    user_table_names = (
+        "good_matches",
+        "top_n_matches",
+        "token_addresses",
+        "block_statistics",
+        "__ukam__distinguishability_matches",
+    )
+    for table_name in user_table_names:
+        con.execute(f'CREATE TABLE "{table_name}" AS SELECT \'user data\' AS marker')
+
+    result = AddressMatcher(
+        canonical_addresses=canonical_data,
+        addresses_to_match=messy_data,
+        con=con,
+        stages=[SplinkStage(final_match_weight_threshold=-20.0)],
+    ).match()
+
+    assert result.matches().count("*").fetchone()[0] == 2
+    for table_name in user_table_names:
+        assert con.table(table_name).fetchall() == [("user data",)]
 
 
 def test_match_from_prepared_folder(con, canonical_data, messy_data):
@@ -444,6 +512,31 @@ def test_prepared_canonical_reuse_preserves_sequential_match_results(
         first_matcher._inverted_index_table_name
         == second_matcher._inverted_index_table_name
     )
+    cached_tables = {
+        row[0]
+        for row in con.execute(
+            """
+            SELECT table_name
+            FROM duckdb_tables()
+            WHERE temporary AND table_name LIKE '__ukam__prepared_%'
+            """
+        ).fetchall()
+    }
+    cached_views = {
+        row[0]
+        for row in con.execute(
+            """
+            SELECT view_name
+            FROM duckdb_views()
+            WHERE temporary AND view_name LIKE '__ukam__prepared_%'
+            """
+        ).fetchall()
+    }
+    assert cached_tables == {first_matcher._canonical_clean.alias}
+    assert cached_views == {
+        first_matcher._tf_table.alias,
+        first_matcher._inverted_index_table_name,
+    }
     assert first_matches.select("unique_id, resolved_canonical_id").fetchall() == [
         ("M1", "C1"),
         ("M2", None),
@@ -451,6 +544,133 @@ def test_prepared_canonical_reuse_preserves_sequential_match_results(
     assert second_matches.select("unique_id, resolved_canonical_id").fetchall() == [
         ("M3", "C3"),
     ]
+
+
+def test_prepared_canonical_cache_invalidates_after_folder_is_rebuilt(
+    con, canonical_data, messy_data, monkeypatch, tmp_path
+):
+    load_calls = 0
+    original_load = address_matcher_module.load_prepared_canonical_data
+
+    def spy_load(*args, **kwargs):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(address_matcher_module, "load_prepared_canonical_data", spy_load)
+
+    prepare_canonical_folder(
+        canonical_data, output_folder=tmp_path, con=con, overwrite=True
+    )
+    first_matcher = AddressMatcher(
+        canonical_addresses=tmp_path,
+        addresses_to_match=messy_data,
+        con=con,
+        stages=[ExactMatchStage()],
+    )
+    first_matcher.match()
+    first_cached_tables = {
+        first_matcher._canonical_clean.alias,
+        first_matcher._tf_table.alias,
+        first_matcher._inverted_index_table_name,
+    }
+
+    replacement_canonical = _make_addresses(
+        con,
+        [
+            {
+                "unique_id": "C4",
+                "address_concat": "4 new street leeds",
+                "postcode": "LS1 1AA",
+            }
+        ],
+    )
+    prepare_canonical_folder(
+        replacement_canonical,
+        output_folder=tmp_path,
+        con=con,
+        overwrite=True,
+    )
+    replacement_messy = _make_addresses(
+        con,
+        [
+            {
+                "unique_id": "M4",
+                "address_concat": "4 new street leeds",
+                "postcode": "LS1 1AA",
+            }
+        ],
+    )
+    second_matcher = AddressMatcher(
+        canonical_addresses=tmp_path,
+        addresses_to_match=replacement_messy,
+        con=con,
+        stages=[ExactMatchStage()],
+    )
+    second_matches = second_matcher.match().matches()
+
+    remaining_tables = {
+        row[0]
+        for row in con.execute(
+            "SELECT table_name FROM information_schema.tables"
+        ).fetchall()
+    }
+    assert load_calls == 2
+    assert second_matches.select("resolved_canonical_id").fetchone() == ("C4",)
+    assert not first_cached_tables & remaining_tables
+    assert len(
+        [name for name in remaining_tables if name.startswith("__ukam__prepared_")]
+    ) == 3
+
+
+def test_prepared_canonical_cache_tables_are_connection_scoped(
+    canonical_data, con, tmp_path
+):
+    prepared_folder = tmp_path / "prepared"
+    prepare_canonical_folder(
+        canonical_data,
+        output_folder=prepared_folder,
+        con=con,
+        overwrite=True,
+    )
+
+    database_path = tmp_path / "matcher.duckdb"
+    file_con = duckdb.connect(str(database_path))
+    try:
+        file_messy = _make_addresses(file_con, MESSY_RECORDS)
+        AddressMatcher(
+            canonical_addresses=prepared_folder,
+            addresses_to_match=file_messy,
+            con=file_con,
+            stages=[ExactMatchStage()],
+        ).match()
+        assert file_con.execute(
+            """
+            SELECT count(*)
+            FROM information_schema.tables
+            WHERE table_name LIKE '__ukam__prepared_%'
+            """
+        ).fetchone()[0] == 3
+    finally:
+        file_con.close()
+
+    file_con_ref = ref(file_con)
+    del file_messy
+    del file_con
+    gc.collect()
+    assert file_con_ref() is None
+
+    reopened = duckdb.connect(str(database_path))
+    try:
+        assert reopened.execute(
+            """
+            SELECT count(*)
+            FROM information_schema.tables
+            WHERE table_name LIKE '__ukam__prepared_%'
+            """
+        ).fetchone() == (0,)
+    finally:
+        reopened.close()
 
 
 def test_match_from_prepared_folder_path_object(con, canonical_data, messy_data):
