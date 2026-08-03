@@ -53,7 +53,8 @@ def run_labels_accuracy() -> int:
     con = duckdb.connect(database=":memory:")
 
     try:
-        labels_export = con.read_csv(str(labels_path))
+        # IDs in labelling exports are strings and may contain leading zeroes.
+        labels_export = con.read_csv(str(labels_path), all_varchar=True)
         con.register("labels_export", labels_export)
 
         messy_data_rel = con.sql(
@@ -64,7 +65,7 @@ def run_labels_accuracy() -> int:
                 messy_postcode AS postcode,
                 unique_id_l::VARCHAR AS ukam_label
             FROM labels_export
-            WHERE human_label = 1
+            WHERE TRY_CAST(human_label AS INTEGER) = 1
             """
         )
 

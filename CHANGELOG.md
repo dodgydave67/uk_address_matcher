@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- `MatchResult.create_labelling_tool()` for reviewing retained address candidates in
+  a local, self-contained HTML file, checkpointing progress, and exporting exact
+  record-level clerical labels plus spreadsheet-safe and compatibility CSVs.
+
 ## [1.1.2] - 2026-04-29
 
 ### Fixed

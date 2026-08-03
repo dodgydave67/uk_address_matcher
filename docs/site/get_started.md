@@ -153,3 +153,90 @@ The examples below use the fictional London datasets from `ukam_datasets`, which
 If you know the correct match for each address, add a `ukam_label` column to
 your messy data. It propagates through to results, enabling accuracy analysis
 with `MatchResult.accuracy_analysis()`.
+
+### Create labels by reviewing candidates
+
+After matching, create a local HTML tool for the records that reached the
+`SplinkStage`:
+
+```python
+tool_path = result.create_labelling_tool(
+    "address_labelling.html",
+    max_candidates=5,
+    messy_ids=["M123", "M456"],  # Omit to review every record that reached Splink
+)
+print(tool_path)
+```
+
+Open the generated file in a browser. It works without a server or internet
+connection, supports keyboard shortcuts, and reports whether browser draft
+autosave is available. Download JSON checkpoints regularly: browser storage for
+local files is browser-dependent. No model candidate is selected automatically,
+and model scores are hidden during review. Use **Download exact labels JSON**
+when identifier round-tripping matters. The parallel labels CSV is hardened for
+opening in spreadsheet software.
+
+The JSON `labels` array and labels CSV have one row per source record:
+
+| Column | Meaning |
+|--------|---------|
+| `unique_id` | Source record's `unique_id` |
+| `ukam_label` | Confirmed canonical `unique_id`; blank for a confirmed non-match or unresolved record |
+| `label_status` | `matched`, `matched_manual`, `confirmed_no_match`, `none_of_candidates`, `manual_unverified`, `pre_existing`, `skipped`, or `unreviewed` |
+| `proposed_ukam_label` | An unverified manual or pre-existing label requiring review |
+| `selected_candidate_rank` | Rank of a confirmed displayed candidate |
+| `selected_match_weight` | Model weight retained for audit, but not shown during review |
+| `recordset_id` | Fingerprint identifying the generated review set |
+| `exported_at_utc` | Export timestamp |
+
+Only `matched`, `matched_manual`, and `confirmed_no_match` are adjudicated ground
+truth. Filter to those statuses and **inner join** the filtered rows to the
+original data before accuracy analysis. This retains confirmed non-matches as a
+null `ukam_label` without turning skipped or unreviewed records into negatives.
+
+“None of these candidates” rejects only the displayed candidate set; it does not
+claim that the property is absent from the full canonical data. “Confirm absent
+from canonical” asks for explicit confirmation that a separate full lookup was
+performed. A manually entered ID outside the displayed candidates starts as
+`manual_unverified`. After checking that ID and its address in the full canonical
+dataset, the reviewer can explicitly promote it to `matched_manual`. Non-null
+labels already present in the input are similarly flagged as `pre_existing`
+until reviewed.
+
+For compatibility with the external-labels benchmark, expand **Compatibility
+export for candidate-pair workflows** and download the optional CSV. Its first
+five columns remain:
+
+| Column | Meaning |
+|--------|---------|
+| `id` | Source record's `unique_id` |
+| `messy_address` | Source address shown to the reviewer |
+| `messy_postcode` | Source postcode shown to the reviewer |
+| `unique_id_l` | Candidate canonical `unique_id` |
+| `human_label` | `1` for the selected candidate, `0` for an explicitly rejected displayed candidate, or blank when unresolved |
+
+After validating the compatibility export, copy or rename
+`ukam_candidate_labels_*.csv` to `address_matching_labels/export.csv` for the
+external-labels workflow. That benchmark consumes only rows where
+`human_label = 1`; its explicit zero labels are retained for other pairwise uses.
+
+This compatibility file contains address text. CSV cells that start like a
+spreadsheet formula (optional whitespace followed by `=`, `+`, `-`, or `@`, or
+a leading tab/newline control character) receive a leading apostrophe. Numeric
+values, including negative match weights, remain numeric. Use the exact labels
+JSON when a legitimate string identifier starts with one of those characters;
+remove a CSV safeguard only after validation.
+
+`max_candidates` is a display cap. The available pool was set when the matcher
+ran by `SplinkStage.improve_top_n_matches` and
+`SplinkStage.improve_threshold_match_weight`. Run with only a permissive
+`SplinkStage` if every source record should reach clerical review.
+
+The selected source `unique_id` values must be unique so exported labels can be
+joined unambiguously. For large runs, use `messy_ids` to create manageable review
+batches; embedding every retained address can produce a large HTML file and
+browser draft.
+
+The HTML and compatibility candidate-pair CSV contain address data; every export
+contains identifiers or decisions. Keep them in an approved local location and
+do not commit real labelled data to the repository.

@@ -18,5 +18,6 @@
       members:
         - matches
         - match_metrics
+        - create_labelling_tool
         - accuracy_analysis
         - accuracy_data
